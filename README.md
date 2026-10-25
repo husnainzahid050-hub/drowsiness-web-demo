@@ -2,7 +2,7 @@
 
 A browser version of my Final Year Project (BS Artificial Intelligence). It detects eye closure, yawning and head pose in real time from your webcam, and the whole thing runs on your own device.
 
-- **Live demo:** LIVE_DEMO_URL
+- **Live demo:** https://drowsiness-web-demo.vercel.app
 - **Original Python + OpenCV project:** ORIGINAL_REPO_URL
 
 This repo is a visual showcase that portfolio visitors can try in one click. The full system is still the original Python project.

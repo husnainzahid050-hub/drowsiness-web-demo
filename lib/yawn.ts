@@ -42,8 +42,9 @@ export class YawnDetector {
 
   update(mar: number, pitch: number | null, ear: number | null, fps: number, tuning: Tuning): boolean {
     const exit = marExitThreshold(tuning);
-    this.suddenLimit = Settings.YAWN_SUDDEN_ONSET_FRAMES;
-    if (fps > 0) this.suddenLimit *= fps / Settings.TARGET_FPS;
+    const rate = fps > 0 ? fps / Settings.TARGET_FPS : 1;
+    this.suddenLimit = Settings.YAWN_SUDDEN_ONSET_FRAMES * rate;
+    const gapLimit = Math.max(2, Math.round(Settings.YAWN_GAP_FRAMES * Math.min(1, rate)));
 
     this.marHistory.push(mar);
     if (this.marHistory.length > 5) this.marHistory.shift();
@@ -73,7 +74,7 @@ export class YawnDetector {
       this.gapFrames = 0;
     } else if (this.consecFrames > 0) {
       this.gapFrames += 1;
-      if (this.gapFrames > Settings.YAWN_GAP_FRAMES) this.endOpening();
+      if (this.gapFrames > gapLimit) this.endOpening();
     }
 
     // Re-checked every frame: a yawn's head tilt or squint can come late.

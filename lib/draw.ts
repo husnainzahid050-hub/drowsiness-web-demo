@@ -1,5 +1,5 @@
 import type { FrameDrawInfo } from "./detector";
-import type { Connection } from "./faceLandmarker";
+import type { Connection } from "./faceTracker";
 import type { Landmark } from "./geometry";
 import type { HeadPoseEstimator } from "./headPose";
 import { Settings } from "./settings";

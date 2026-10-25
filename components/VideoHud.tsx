@@ -1,21 +1,17 @@
 import type { Snapshot } from "@/lib/detector";
-import type { Delegate } from "@/lib/faceLandmarker";
-import type { ModelState } from "./DemoCamera";
+import type { TrackerStatus } from "@/lib/faceTracker";
 import { describeStatus } from "./status";
 
 interface Props {
   snapshot: Snapshot;
-  modelState: ModelState;
-  modelProgress: number;
-  warming: boolean;
-  delegate: Delegate | null;
+  tracker: TrackerStatus;
   inferMs: number;
   resolution: string;
   onRetryModel: () => void;
 }
 
-export default function VideoHud({ snapshot, modelState, modelProgress, warming, delegate, inferMs, resolution, onRetryModel }: Props) {
-  const ready = modelState === "ready" && !warming;
+export default function VideoHud({ snapshot, tracker, inferMs, resolution, onRetryModel }: Props) {
+  const ready = tracker.state === "ready";
   const status = describeStatus(snapshot, true, ready);
 
   return (
@@ -28,10 +24,16 @@ export default function VideoHud({ snapshot, modelState, modelProgress, warming,
           </Chip>
           {ready && (
             <Chip className="font-mono">
-              {snapshot.fps > 0 ? `${snapshot.fps.toFixed(0)} FPS` : "-- FPS"} · {inferMs.toFixed(0)} ms · {delegate}
+              {snapshot.fps > 0 ? `${snapshot.fps.toFixed(0)} FPS` : "-- FPS"} · {inferMs.toFixed(0)} ms · {tracker.delegate}
             </Chip>
           )}
           {resolution && <Chip className="hidden font-mono sm:inline-flex">{resolution}</Chip>}
+          {ready && tracker.gpuWarming && (
+            <Chip className="text-zinc-300">
+              <span className="h-2.5 w-2.5 animate-spin rounded-full border border-zinc-500 border-t-emerald-400" />
+              GPU warming up
+            </Chip>
+          )}
           {snapshot.glasses && <Chip className="bg-sky-500/20 text-sky-200">Glasses mode</Chip>}
         </div>
         {ready && (
@@ -63,24 +65,20 @@ export default function VideoHud({ snapshot, modelState, modelProgress, warming,
           <span />
         )}
 
-        {modelState === "loading" && (
+        {(tracker.state === "loading" || tracker.state === "idle") && (
           <div className="w-56 rounded-xl bg-black/70 p-3">
-            <p className="text-xs text-zinc-200">Loading AI model… {Math.round(modelProgress * 100)}%</p>
+            <p className="text-xs text-zinc-200">
+              {tracker.progress < 1 ? `Loading AI model… ${Math.round(tracker.progress * 100)}%` : "Starting AI engine…"}
+            </p>
             <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/10">
-              <div className="h-full rounded-full bg-emerald-400 transition-[width]" style={{ width: `${Math.max(4, modelProgress * 100)}%` }} />
+              <div
+                className={`h-full rounded-full bg-emerald-400 transition-[width] ${tracker.progress >= 1 ? "animate-pulse" : ""}`}
+                style={{ width: `${Math.max(4, tracker.progress * 100)}%` }}
+              />
             </div>
           </div>
         )}
-        {modelState === "ready" && warming && (
-          <div className="w-72 rounded-xl bg-black/75 p-3">
-            <p className="flex items-center gap-2 text-xs font-medium text-zinc-100">
-              <span className="h-3 w-3 animate-spin rounded-full border border-zinc-500 border-t-emerald-400" />
-              Preparing the AI for your graphics card
-            </p>
-            <p className="mt-1 text-[11px] text-zinc-400">First run only. Look at the camera; the page may pause for a few seconds.</p>
-          </div>
-        )}
-        {modelState === "error" && (
+        {tracker.state === "error" && (
           <div className="pointer-events-auto rounded-xl bg-black/75 p-3 text-xs text-zinc-200">
             <p>The AI model could not load. Check your connection.</p>
             <button type="button" onClick={onRetryModel} className="mt-2 font-semibold text-emerald-300 hover:text-emerald-200">

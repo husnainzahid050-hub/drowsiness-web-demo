@@ -30,6 +30,7 @@ export interface Snapshot {
   poseValid: boolean;
   poseStatus: PoseStatus;
   poseFrames: number;
+  poseFramesNeeded: number;
   glasses: boolean;
   alertActive: boolean;
   reasons: AlertReason[];
@@ -66,6 +67,7 @@ export const EMPTY_SNAPSHOT: Snapshot = {
   poseValid: false,
   poseStatus: "No Pose",
   poseFrames: 0,
+  poseFramesNeeded: Settings.HEAD_POSE_CONSEC_FRAMES,
   glasses: false,
   alertActive: false,
   reasons: [],
@@ -94,8 +96,7 @@ export class DrowsinessEngine {
   private reasons: AlertReason[] = [];
   private frameCounter = 0;
   private fps = 0;
-  private fpsCounter = 0;
-  private fpsTimer = performance.now();
+  private frameTimes: number[] = [];
   private last: Snapshot = EMPTY_SNAPSHOT;
 
   constructor(alerts: AlertManager) {
@@ -120,17 +121,19 @@ export class DrowsinessEngine {
     this.glasses.update(avgEar, pitch);
 
     const mar = computeMar(pixelCoords(landmarks, MOUTH_INDICES, w, h));
-    const yawnActive = this.yawn.update(mar, pitch, avgEar, this.fps, tuning);
+    const yawnFramesNeeded = this.frames(tuning.yawnFrames);
+    const yawnActive = this.yawn.update(mar, pitch, avgEar, this.fps, { ...tuning, yawnFrames: yawnFramesNeeded });
 
     const glasses = this.glasses.glassesDetected;
     const earThreshold = this.glasses.adjustedEarThreshold(tuning);
     this.consecFrames = avgEar < earThreshold ? this.consecFrames + 1 : 0;
     this.poseConsec = this.headPose.isDrowsyPose(tuning) ? this.poseConsec + 1 : 0;
 
-    const closedFramesNeeded = Math.trunc(tuning.consecFrames * (glasses ? Settings.GLASSES_CONSEC_MULTIPLIER : 1));
+    const closedFramesNeeded = this.frames(Math.trunc(tuning.consecFrames * (glasses ? Settings.GLASSES_CONSEC_MULTIPLIER : 1)));
+    const poseFramesNeeded = this.frames(Settings.HEAD_POSE_CONSEC_FRAMES);
     const reasons: AlertReason[] = [];
     if (this.consecFrames >= closedFramesNeeded) reasons.push("eyes");
-    if (this.poseConsec >= Settings.HEAD_POSE_CONSEC_FRAMES) reasons.push("head");
+    if (this.poseConsec >= poseFramesNeeded) reasons.push("head");
     if (yawnActive) reasons.push("yawn");
 
     if (reasons.length) {
@@ -138,7 +141,7 @@ export class DrowsinessEngine {
         this.alertActive = true;
         this.totalAlerts += 1;
       }
-      this.alerts.trigger(this.frameCounter);
+      this.alerts.trigger(this.frameCounter, this.frames(Settings.ALERT_REPEAT_INTERVAL));
     } else {
       this.alertActive = false;
       this.alerts.clear();
@@ -158,7 +161,7 @@ export class DrowsinessEngine {
       yawnActive,
       surpriseActive: this.yawn.surpriseActive,
       yawnFrames: this.yawn.consecFrames,
-      yawnFramesNeeded: tuning.yawnFrames,
+      yawnFramesNeeded,
       totalYawns: this.yawn.totalYawns,
       yawnCues: this.yawn.lastCues,
       pitch,
@@ -167,6 +170,7 @@ export class DrowsinessEngine {
       poseValid: this.headPose.poseValid,
       poseStatus: this.headPose.status(tuning),
       poseFrames: this.poseConsec,
+      poseFramesNeeded,
       glasses,
       ...this.alertFields(),
       fps: this.fps,
@@ -194,6 +198,13 @@ export class DrowsinessEngine {
     this.headPose.reset();
   }
 
+  // Frame counts are defined for 30 FPS, as in the Python version. When frames
+  // arrive slower, they are scaled so that the same amount of time must pass.
+  private frames(count: number): number {
+    const scale = this.fps > 0 ? Math.min(1, this.fps / Settings.TARGET_FPS) : 1;
+    return Math.max(3, Math.round(count * scale));
+  }
+
   private alertFields() {
     return {
       alertActive: this.alertActive,
@@ -203,13 +214,14 @@ export class DrowsinessEngine {
     };
   }
 
+  // Frames processed in the last second (the Python version averaged every
+  // 30 frames; a sliding window reacts faster when the rate changes).
   private updateFps() {
-    this.fpsCounter += 1;
-    if (this.fpsCounter >= 30) {
-      const now = performance.now();
-      this.fps = (this.fpsCounter * 1000) / (now - this.fpsTimer);
-      this.fpsTimer = now;
-      this.fpsCounter = 0;
+    const now = performance.now();
+    this.frameTimes.push(now);
+    while (this.frameTimes[0] < now - 1000) this.frameTimes.shift();
+    if (this.frameTimes.length >= 3) {
+      this.fps = ((this.frameTimes.length - 1) * 1000) / (now - this.frameTimes[0]);
     }
   }
 }

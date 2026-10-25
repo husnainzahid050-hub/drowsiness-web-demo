@@ -39,8 +39,9 @@ export default function HowItWorks() {
       <p className="eyebrow">How it works</p>
       <h2 className="mt-1 text-3xl font-semibold tracking-tight text-white">Same logic as the Python system</h2>
       <p className="mt-2 max-w-2xl text-sm text-zinc-400">
-        MediaPipe finds the face landmarks in every frame. Everything after that (ratios, counters, pose, glasses mode,
-        alerts) is a direct port of the original OpenCV project, with the same thresholds.
+        MediaPipe finds the face landmarks in every frame, in a background worker so the page stays smooth. Everything
+        after that (ratios, counters, pose, glasses mode, alerts) is a direct port of the original OpenCV project, with
+        the same thresholds. Frame counts are defined at 30 FPS and scaled to your device&apos;s real rate.
       </p>
 
       <ol className="mt-8 flex flex-wrap items-center gap-2">

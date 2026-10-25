@@ -17,14 +17,16 @@ The detection logic is a direct TypeScript port of the Python project, with the 
 - **Alerts:** 880 Hz beep repeated every 60 frames + simulated seat vibration (300/100/300/100/800 ms buzz pattern); phones vibrate for real
 - Live EAR graph, per-feature frame counters, session stats, FPS and inference time
 - Sensitivity sliders (defaults = Python settings), sound and face-mesh toggles, Reset, **Stop Camera**
-- Video shows the moment the camera opens; the model loads in parallel with a progress bar
-- GPU (WebGL) with automatic CPU fallback, one-time GPU warm-up message, detection paused in hidden tabs
+- Video shows the moment the camera opens; the model starts loading as soon as the page opens
+- Detection runs in Web Workers, so the page never freezes: the CPU worker detects within about a second while the GPU worker warms up in the background, then the faster of the two is kept
+- Frame counts are defined at 30 FPS like the Python version and scaled to the real detection rate, so alerts take the same time on slower devices
+- Detection pauses in hidden tabs
 
 ## Tech stack
 
 - [Next.js](https://nextjs.org) (App Router) + TypeScript, Tailwind CSS
 - [MediaPipe Face Landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) (`@mediapipe/tasks-vision`), client-side
-- Canvas 2D for the overlay and graph, Web Audio API for the alarm (no audio files)
+- Web Workers for detection, Canvas 2D for the overlay and graph, Web Audio API for the alarm (no audio files)
 
 The MediaPipe runtime and model are served from this site (`public/`), not a third-party CDN. There is no backend, API route, database, analytics or environment variable.
 

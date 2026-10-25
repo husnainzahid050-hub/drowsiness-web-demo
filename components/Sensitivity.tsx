@@ -15,7 +15,7 @@ const SLIDERS: {
   format: (v: number) => string;
 }[] = [
   { key: "earThreshold", label: "EAR threshold", hint: "Eyes count as closed below this", min: 0.15, max: 0.3, step: 0.01, format: (v) => v.toFixed(2) },
-  { key: "consecFrames", label: "Closed-eye frames", hint: "At 30 FPS, 20 frames ≈ 0.7 s", min: 5, max: 60, step: 1, format: (v) => `${v}` },
+  { key: "consecFrames", label: "Closed-eye frames", hint: "At 30 FPS (scaled to your rate), 20 frames ≈ 0.7 s", min: 5, max: 60, step: 1, format: (v) => `${v}` },
   { key: "marThreshold", label: "MAR threshold", hint: "Mouth counts as wide open above this", min: 0.35, max: 0.8, step: 0.05, format: (v) => v.toFixed(2) },
   { key: "yawnFrames", label: "Yawn frames", hint: "Wide-open frames before a yawn is judged", min: 10, max: 60, step: 1, format: (v) => `${v}` },
   { key: "pitchThreshold", label: "Nod limit (pitch)", hint: "Forward head drop that counts as a nod", min: 10, max: 45, step: 1, format: (v) => `${v}°` },

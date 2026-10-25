@@ -24,9 +24,9 @@ export class AlertManager {
     void this.ctx?.resume();
   }
 
-  trigger(frameCount: number) {
+  trigger(frameCount: number, repeatEvery: number = Settings.ALERT_REPEAT_INTERVAL) {
     this.alertActive = true;
-    if (frameCount - this.lastAudioFrame >= Settings.ALERT_REPEAT_INTERVAL) {
+    if (frameCount - this.lastAudioFrame >= repeatEvery) {
       this.lastAudioFrame = frameCount;
       this.beep();
     }

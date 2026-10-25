@@ -74,7 +74,7 @@ export default function StatusPanel({ snapshot: s, live, modelReady, sessionStar
           <Stat label="Yaw" value={on ? `${s.yaw.toFixed(1)}°` : "--"} />
           <Stat label="Roll" value={on ? `${s.roll.toFixed(1)}°` : "--"} alert={on && s.poseStatus === "Tilting"} />
         </div>
-        <Progress label="Bad-pose frames" value={on ? s.poseFrames : 0} max={Settings.HEAD_POSE_CONSEC_FRAMES} hint="nod or tilt" />
+        <Progress label="Bad-pose frames" value={on ? s.poseFrames : 0} max={s.poseFramesNeeded} hint="nod or tilt" />
       </Card>
 
       <Card icon={<BellIcon />} title="Alerts" note={muted ? "Sound muted" : "Beep + seat vibration"}>

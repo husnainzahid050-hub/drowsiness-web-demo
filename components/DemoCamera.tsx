@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { loadFaceModel, type Delegate, type FaceModel } from "@/lib/faceLandmarker";
+import { FaceTracker, type TrackerStatus } from "@/lib/faceTracker";
+import type { Landmark } from "@/lib/geometry";
 import { clearOverlay, drawOverlay } from "@/lib/draw";
 import { DEFAULT_TUNING, Settings, type Tuning } from "@/lib/settings";
 import { START_DEMO_EVENT } from "@/lib/site";
@@ -13,7 +14,6 @@ import Sensitivity from "./Sensitivity";
 import { CameraIcon, LockIcon, Spinner } from "./icons";
 
 type Phase = "idle" | "starting" | "live" | "error";
-export type ModelState = "idle" | "loading" | "ready" | "error";
 type CameraError = "denied" | "nodevice" | "busy" | "unsupported" | "unknown";
 
 const ERRORS: Record<CameraError, { title: string; body: string }> = {
@@ -43,33 +43,35 @@ function cameraErrorKind(err: unknown): CameraError {
 
 type FrameHandle = { kind: "vfc" | "raf"; id: number } | null;
 
+const IDLE_TRACKER: TrackerStatus = { state: "idle", progress: 0, delegate: null, gpuWarming: false };
+
+function toLandmarks(flat: Float32Array): Landmark[] {
+  const out: Landmark[] = new Array(flat.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = { x: flat[i * 2], y: flat[i * 2 + 1] };
+  return out;
+}
+
 export default function DemoCamera() {
   const sectionRef = useRef<HTMLElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const modelRef = useRef<FaceModel | null>(null);
+  const trackerRef = useRef<FaceTracker | null>(null);
   const handleRef = useRef<FrameHandle>(null);
   const runningRef = useRef(false);
   const startingRef = useRef(false);
   const mountedRef = useRef(true);
   const meshRef = useRef(false);
-  const failuresRef = useRef(0);
-  const fallbackRef = useRef(false);
   const inferMsRef = useRef(0);
   const inferPublishRef = useRef(0);
-  const detectAllowedRef = useRef(false);
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [cameraError, setCameraError] = useState<CameraError | null>(null);
-  const [modelState, setModelState] = useState<ModelState>("idle");
-  const [modelProgress, setModelProgress] = useState(0);
-  const [delegate, setDelegate] = useState<Delegate | null>(null);
+  const [tracker, setTracker] = useState<TrackerStatus>(IDLE_TRACKER);
   const [inferMs, setInferMs] = useState(0);
   const [resolution, setResolution] = useState("");
   const [tuning, setTuning] = useState<Tuning>(DEFAULT_TUNING);
   const [showMesh, setShowMesh] = useState(false);
-  const [gpuWarming, setGpuWarming] = useState(false);
 
   const detector = useDrowsinessDetector(tuning);
   const { snapshot, muted, setMuted, sessionStart, newSession, endSession, resetState, pauseAlerts, processFrame, historyRef } =
@@ -79,32 +81,9 @@ export default function DemoCamera() {
     meshRef.current = showMesh;
   }, [showMesh]);
 
-  const ensureModel = useCallback((preferred: Delegate = "GPU") => {
-    if (modelRef.current) return;
-    setModelState("loading");
-    loadFaceModel(preferred, (p) => mountedRef.current && setModelProgress(p))
-      .then((model) => {
-        if (!mountedRef.current) return;
-        modelRef.current = model;
-        setDelegate(model.delegate);
-        setGpuWarming(!model.warmed);
-        setModelState("ready");
-      })
-      .catch(() => mountedRef.current && setModelState("error"));
-  }, []);
-
-  const switchToCpu = useCallback(() => {
-    if (fallbackRef.current) return;
-    fallbackRef.current = true;
-    loadFaceModel("CPU")
-      .then((model) => {
-        if (!mountedRef.current) return;
-        modelRef.current = model;
-        failuresRef.current = 0;
-        setDelegate("CPU");
-        setGpuWarming(false);
-      })
-      .catch(() => mountedRef.current && setModelState("error"));
+  const ensureModel = useCallback(() => {
+    trackerRef.current ??= new FaceTracker((status) => mountedRef.current && setTracker(status));
+    trackerRef.current.load().catch(() => undefined);
   }, []);
 
   const stopLoop = useCallback(() => {
@@ -121,8 +100,8 @@ export default function DemoCamera() {
     if (!video) return;
     let lastTime = -1;
 
-    // requestVideoFrameCallback fires once per camera frame, so detection runs
-    // exactly at the camera rate (like the Python cap.read() loop).
+    // One callback per camera frame. Detection runs in a worker; when its queue
+    // is full the frame is skipped, so results never lag behind the camera.
     const schedule = () => {
       handleRef.current =
         typeof video.requestVideoFrameCallback === "function"
@@ -133,51 +112,43 @@ export default function DemoCamera() {
     const onFrame = () => {
       if (!runningRef.current) return;
       schedule();
-      const canvas = canvasRef.current;
-      const model = modelRef.current;
-      if (!canvas || !model || video.readyState < 2 || video.videoWidth === 0) return;
-      // Let the "preparing" message paint before the first GPU run blocks.
-      if (!model.warmed && !detectAllowedRef.current) return;
-      if (video.currentTime === lastTime) return;
+      const faceTracker = trackerRef.current;
+      if (!faceTracker?.canDetect) return;
+      if (video.readyState < 2 || video.videoWidth === 0 || video.currentTime === lastTime) return;
       lastTime = video.currentTime;
 
       const w = video.videoWidth;
       const h = video.videoHeight;
-      if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-      }
+      faceTracker.detect(video, performance.now()).then(
+        (result) => {
+          const canvas = canvasRef.current;
+          if (!result || !runningRef.current || !canvas) return;
+          if (canvas.width !== w || canvas.height !== h) {
+            canvas.width = w;
+            canvas.height = h;
+          }
 
-      const started = performance.now();
-      let landmarks;
-      try {
-        landmarks = model.landmarker.detectForVideo(video, started).faceLandmarks[0] ?? null;
-        failuresRef.current = 0;
-      } catch {
-        failuresRef.current += 1;
-        if (failuresRef.current >= 5 && model.delegate === "GPU") switchToCpu();
-        return;
-      }
-      if (!model.warmed && landmarks) {
-        // This frame compiled the GPU shaders; its time says nothing about speed.
-        model.warmed = true;
-        setGpuWarming(false);
-      } else {
-        const took = performance.now() - started;
-        inferMsRef.current = inferMsRef.current ? inferMsRef.current * 0.8 + took * 0.2 : took;
-        if (started - inferPublishRef.current > 500) {
-          inferPublishRef.current = started;
-          setInferMs(inferMsRef.current);
-        }
-      }
+          inferMsRef.current = inferMsRef.current ? inferMsRef.current * 0.8 + result.ms * 0.2 : result.ms;
+          const now = performance.now();
+          if (now - inferPublishRef.current > 500) {
+            inferPublishRef.current = now;
+            setInferMs(inferMsRef.current);
+          }
 
-      const out = processFrame(landmarks, w, h);
-      if (landmarks && out) drawOverlay(canvas, landmarks, out.draw, out.headPose, meshRef.current ? model.tesselation : null);
-      else clearOverlay(canvas);
+          const landmarks = result.landmarks ? toLandmarks(result.landmarks) : null;
+          const out = processFrame(landmarks, w, h);
+          if (landmarks && out) {
+            drawOverlay(canvas, landmarks, out.draw, out.headPose, meshRef.current ? faceTracker.tesselation : null);
+          } else {
+            clearOverlay(canvas);
+          }
+        },
+        () => undefined,
+      );
     };
 
     schedule();
-  }, [stopLoop, processFrame, switchToCpu]);
+  }, [stopLoop, processFrame]);
 
   const releaseCamera = useCallback(() => {
     runningRef.current = false;
@@ -244,34 +215,22 @@ export default function DemoCamera() {
     }
   }, [newSession, ensureModel, startLoop, releaseCamera]);
 
+  // Start downloading and compiling the model as soon as the page is idle,
+  // so it is usually ready before the visitor clicks Start Camera.
   useEffect(() => {
-    detectAllowedRef.current = false;
-    if (phase !== "live" || !gpuWarming) return;
-    let id = requestAnimationFrame(() => {
-      id = requestAnimationFrame(() => {
-        detectAllowedRef.current = true;
-      });
-    });
-    return () => cancelAnimationFrame(id);
-  }, [phase, gpuWarming]);
-
-  // Warm the model up as soon as the demo is on screen, so it is usually
-  // ready before the visitor clicks Start Camera.
-  useEffect(() => {
-    const el = sectionRef.current;
-    if (!el) return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          ensureModel();
-          io.disconnect();
-        }
-      },
-      { rootMargin: "200px" },
-    );
-    io.observe(el);
-    return () => io.disconnect();
+    const idle = window.requestIdleCallback ?? ((cb: () => void) => window.setTimeout(cb, 200));
+    const cancel = window.cancelIdleCallback ?? window.clearTimeout;
+    const id = idle(() => ensureModel());
+    return () => cancel(id);
   }, [ensureModel]);
+
+  useEffect(
+    () => () => {
+      trackerRef.current?.dispose();
+      trackerRef.current = null;
+    },
+    [],
+  );
 
   useEffect(() => {
     const onStart = () => {
@@ -358,10 +317,7 @@ export default function DemoCamera() {
             {live && (
               <VideoHud
                 snapshot={snapshot}
-                modelState={modelState}
-                modelProgress={modelProgress}
-                warming={gpuWarming}
-                delegate={delegate}
+                tracker={tracker}
                 inferMs={inferMs}
                 resolution={resolution}
                 onRetryModel={() => ensureModel()}
@@ -383,7 +339,7 @@ export default function DemoCamera() {
                   <CameraIcon className="h-5 w-5" />
                   Start Camera
                 </button>
-                <ModelBadge state={modelState} progress={modelProgress} />
+                <ModelBadge state={tracker.state} progress={tracker.progress} />
               </Overlay>
             )}
 
@@ -425,11 +381,11 @@ export default function DemoCamera() {
             <ToggleChip label="Face mesh" on={showMesh} onChange={setShowMesh} />
           </div>
 
-          <EarChart historyRef={historyRef} active={live && modelState === "ready" && !gpuWarming} />
+          <EarChart historyRef={historyRef} active={live && tracker.state === "ready"} />
         </div>
 
         <div className="flex flex-col gap-4">
-          <StatusPanel snapshot={snapshot} live={live} modelReady={modelState === "ready" && !gpuWarming} sessionStart={sessionStart} muted={muted} />
+          <StatusPanel snapshot={snapshot} live={live} modelReady={tracker.state === "ready"} sessionStart={sessionStart} muted={muted} />
           <Sensitivity tuning={tuning} onChange={setTuning} />
         </div>
       </div>
@@ -445,14 +401,16 @@ function Overlay({ children }: { children: React.ReactNode }) {
   );
 }
 
-function ModelBadge({ state, progress }: { state: ModelState; progress: number }) {
+function ModelBadge({ state, progress }: { state: TrackerStatus["state"]; progress: number }) {
   if (state === "idle") return null;
   const text =
     state === "ready"
       ? "AI model ready"
       : state === "error"
         ? "AI model will load when you start"
-        : `Preparing AI model… ${Math.round(progress * 100)}%`;
+        : progress < 1
+          ? `Preparing AI model… ${Math.round(progress * 100)}%`
+          : "Starting AI engine…";
   return (
     <p className="flex items-center gap-2 text-xs text-zinc-500">
       <span className={`h-1.5 w-1.5 rounded-full ${state === "ready" ? "bg-emerald-400" : "bg-zinc-500"}`} />

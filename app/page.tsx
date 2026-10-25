@@ -63,9 +63,11 @@ export default function Home() {
           <a href={GITHUB_REPO_URL} target="_blank" rel="noopener noreferrer" className="hover:text-white">
             GitHub
           </a>
-          <a href={LINKEDIN_URL} target="_blank" rel="noopener noreferrer" className="hover:text-white">
-            LinkedIn
-          </a>
+          {LINKEDIN_URL.startsWith("http") && (
+            <a href={LINKEDIN_URL} target="_blank" rel="noopener noreferrer" className="hover:text-white">
+              LinkedIn
+            </a>
+          )}
         </div>
       </footer>
     </div>

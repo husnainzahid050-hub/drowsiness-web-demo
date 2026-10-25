@@ -1,70 +1,96 @@
-import type { Connection, FaceConnections } from "./faceLandmarker";
-import { LEFT_EYE, MOUTH_POINTS, RIGHT_EYE, type Point } from "./metrics";
+import type { FrameDrawInfo } from "./detector";
+import type { Connection } from "./faceLandmarker";
+import type { Landmark } from "./geometry";
+import type { HeadPoseEstimator } from "./headPose";
+import { Settings } from "./settings";
+import { MOUTH_INDICES, MOUTH_OUTLINE_INDICES } from "./yawn";
 
 const OK = "#34d399";
-const ALERT = "#f87171";
-const MESH = "rgba(148, 163, 184, 0.28)";
-
-export interface OverlayState {
-  eyesClosed: boolean;
-  mouthOpen: boolean;
-  showMesh: boolean;
-}
-
-function strokeConnections(
-  ctx: CanvasRenderingContext2D,
-  pts: Point[],
-  connections: Connection[],
-  color: string,
-  width: number,
-) {
-  ctx.strokeStyle = color;
-  ctx.lineWidth = width;
-  ctx.beginPath();
-  for (const { start, end } of connections) {
-    const a = pts[start];
-    const b = pts[end];
-    if (!a || !b) continue;
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-  }
-  ctx.stroke();
-}
-
-function dots(ctx: CanvasRenderingContext2D, pts: Point[], idx: readonly number[], color: string, r: number) {
-  ctx.fillStyle = color;
-  for (const i of idx) {
-    const p = pts[i];
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-    ctx.fill();
-  }
-}
+const ALERT = "#f43f5e";
+const WARNING = "#fb923c";
+const MOUTH_OK = "#2dd4bf";
+const MESH = "rgba(148, 163, 184, 0.22)";
+const AXIS = { x: "#f43f5e", y: "#34d399", z: "#60a5fa" };
 
 export function clearOverlay(canvas: HTMLCanvasElement) {
   canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
 }
 
+function polyline(ctx: CanvasRenderingContext2D, lm: readonly Landmark[], idx: readonly number[], w: number, h: number, close: boolean) {
+  ctx.beginPath();
+  idx.forEach((i, n) => {
+    const x = lm[i].x * w;
+    const y = lm[i].y * h;
+    if (n === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  if (close) ctx.closePath();
+  ctx.stroke();
+}
+
+function dots(ctx: CanvasRenderingContext2D, lm: readonly Landmark[], idx: readonly number[], w: number, h: number, r: number) {
+  ctx.beginPath();
+  for (const i of idx) {
+    const x = lm[i].x * w;
+    const y = lm[i].y * h;
+    ctx.moveTo(x + r, y);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+  }
+  ctx.fill();
+}
+
 export function drawOverlay(
   canvas: HTMLCanvasElement,
-  pts: Point[],
-  connections: FaceConnections,
-  state: OverlayState,
+  lm: readonly Landmark[],
+  info: FrameDrawInfo,
+  headPose: HeadPoseEstimator,
+  mesh: Connection[] | null,
 ) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const w = canvas.width;
+  const h = canvas.height;
+  const s = Math.max(1, w / 640);
+  ctx.clearRect(0, 0, w, h);
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
 
-  const scale = Math.max(1, canvas.width / 640);
-  if (state.showMesh) strokeConnections(ctx, pts, connections.tesselation, MESH, 0.6 * scale);
+  if (mesh) {
+    ctx.strokeStyle = MESH;
+    ctx.lineWidth = 0.6 * s;
+    ctx.beginPath();
+    for (const { start, end } of mesh) {
+      ctx.moveTo(lm[start].x * w, lm[start].y * h);
+      ctx.lineTo(lm[end].x * w, lm[end].y * h);
+    }
+    ctx.stroke();
+  }
 
-  const eyeColor = state.eyesClosed ? ALERT : OK;
-  strokeConnections(ctx, pts, connections.leftEye, eyeColor, 1.5 * scale);
-  strokeConnections(ctx, pts, connections.rightEye, eyeColor, 1.5 * scale);
-  dots(ctx, pts, LEFT_EYE, eyeColor, 2.5 * scale);
-  dots(ctx, pts, RIGHT_EYE, eyeColor, 2.5 * scale);
+  const eye = info.eyesClosed ? ALERT : OK;
+  ctx.strokeStyle = eye;
+  ctx.fillStyle = eye;
+  ctx.lineWidth = 1.6 * s;
+  polyline(ctx, lm, Settings.LEFT_EYE_OUTLINE, w, h, true);
+  polyline(ctx, lm, Settings.RIGHT_EYE_OUTLINE, w, h, true);
+  dots(ctx, lm, Settings.LEFT_EYE_INDICES, w, h, 2.2 * s);
+  dots(ctx, lm, Settings.RIGHT_EYE_INDICES, w, h, 2.2 * s);
 
-  const mouthColor = state.mouthOpen ? ALERT : OK;
-  strokeConnections(ctx, pts, connections.lips, mouthColor, 1.2 * scale);
-  dots(ctx, pts, MOUTH_POINTS, mouthColor, 2.5 * scale);
+  const mouth = info.mouth === "yawn" ? ALERT : info.mouth === "surprise" ? WARNING : MOUTH_OK;
+  ctx.strokeStyle = mouth;
+  ctx.fillStyle = mouth;
+  ctx.lineWidth = 1.6 * s;
+  polyline(ctx, lm, MOUTH_OUTLINE_INDICES, w, h, false);
+  dots(ctx, lm, MOUTH_INDICES, w, h, 2.2 * s);
+
+  const axes = headPose.axes();
+  if (axes) {
+    ctx.lineWidth = 2.5 * s;
+    for (const key of ["x", "y", "z"] as const) {
+      ctx.strokeStyle = AXIS[key];
+      ctx.beginPath();
+      ctx.moveTo(axes.origin[0], axes.origin[1]);
+      ctx.lineTo(axes[key][0], axes[key][1]);
+      ctx.stroke();
+    }
+  }
 }

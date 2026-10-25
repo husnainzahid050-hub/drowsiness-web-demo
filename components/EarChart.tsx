@@ -3,31 +3,41 @@
 import { useEffect, useRef, type RefObject } from "react";
 import { HISTORY_MS, type EarSample } from "@/hooks/useDrowsinessDetector";
 
-const Y_MAX = 0.5;
+const Y_MAX = 0.45;
 const PAD = { left: 36, right: 10, top: 10, bottom: 22 };
 
 interface Props {
   historyRef: RefObject<EarSample[]>;
-  threshold: number;
   active: boolean;
 }
 
-export default function EarChart({ historyRef, threshold, active }: Props) {
+export default function EarChart({ historyRef, active }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const thresholdRef = useRef(threshold);
+  const activeRef = useRef(active);
 
   useEffect(() => {
-    thresholdRef.current = threshold;
-  }, [threshold]);
+    activeRef.current = active;
+  }, [active]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (!canvas || !ctx) return;
     let raf = 0;
+    let lastDraw = 0;
+    let drewIdle = false;
 
-    const draw = () => {
+    // 20 redraws per second is smooth enough and leaves the GPU to the model.
+    const draw = (now: number) => {
       raf = requestAnimationFrame(draw);
+      if (now - lastDraw < 50) return;
+      lastDraw = now;
+      if (!activeRef.current) {
+        if (drewIdle) return;
+        drewIdle = true;
+      } else {
+        drewIdle = false;
+      }
       const dpr = window.devicePixelRatio || 1;
       const w = canvas.clientWidth;
       const h = canvas.clientHeight;
@@ -43,11 +53,12 @@ export default function EarChart({ historyRef, threshold, active }: Props) {
       const y = (v: number) => PAD.top + plotH * (1 - Math.min(Math.max(v, 0), Y_MAX) / Y_MAX);
       const end = performance.now();
       const x = (t: number) => PAD.left + plotW * (1 - (end - t) / HISTORY_MS);
+      const samples = historyRef.current;
 
-      ctx.font = "11px ui-monospace, monospace";
+      ctx.font = "10px ui-monospace, monospace";
       ctx.lineWidth = 1;
       for (let v = 0; v <= Y_MAX + 1e-9; v += 0.1) {
-        ctx.strokeStyle = "rgba(63, 63, 70, 0.6)";
+        ctx.strokeStyle = "rgba(255,255,255,0.06)";
         ctx.beginPath();
         ctx.moveTo(PAD.left, y(v));
         ctx.lineTo(w - PAD.right, y(v));
@@ -59,38 +70,42 @@ export default function EarChart({ historyRef, threshold, active }: Props) {
       }
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
-      ctx.fillText("-10s", PAD.left, h - PAD.bottom + 6);
+      ctx.fillText("-10s", PAD.left + 12, h - PAD.bottom + 6);
       ctx.fillText("-5s", PAD.left + plotW / 2, h - PAD.bottom + 6);
-      ctx.fillText("now", w - PAD.right - 10, h - PAD.bottom + 6);
-
-      const ty = y(thresholdRef.current);
-      ctx.strokeStyle = "#fbbf24";
-      ctx.setLineDash([6, 5]);
-      ctx.beginPath();
-      ctx.moveTo(PAD.left, ty);
-      ctx.lineTo(w - PAD.right, ty);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      ctx.fillText("now", w - PAD.right - 12, h - PAD.bottom + 6);
 
       ctx.save();
       ctx.beginPath();
       ctx.rect(PAD.left, PAD.top, plotW, plotH);
       ctx.clip();
-      ctx.strokeStyle = "#38bdf8";
+
+      const lastThreshold = samples.length ? samples[samples.length - 1].threshold : 0.21;
+      ctx.strokeStyle = "#fbbf24";
+      ctx.setLineDash([6, 5]);
+      ctx.beginPath();
+      ctx.moveTo(PAD.left, y(lastThreshold));
+      ctx.lineTo(w - PAD.right, y(lastThreshold));
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Line coloured red where EAR is below the threshold in use.
       ctx.lineWidth = 2;
       ctx.lineJoin = "round";
-      ctx.beginPath();
-      let drawing = false;
-      for (const s of historyRef.current) {
+      let prev: EarSample | null = null;
+      for (const s of samples) {
         if (Number.isNaN(s.ear)) {
-          drawing = false;
+          prev = null;
           continue;
         }
-        if (drawing) ctx.lineTo(x(s.t), y(s.ear));
-        else ctx.moveTo(x(s.t), y(s.ear));
-        drawing = true;
+        if (prev) {
+          ctx.strokeStyle = s.ear < s.threshold ? "#f43f5e" : "#34d399";
+          ctx.beginPath();
+          ctx.moveTo(x(prev.t), y(prev.ear));
+          ctx.lineTo(x(s.t), y(s.ear));
+          ctx.stroke();
+        }
+        prev = s;
       }
-      ctx.stroke();
       ctx.restore();
     };
 
@@ -101,19 +116,23 @@ export default function EarChart({ historyRef, threshold, active }: Props) {
   return (
     <div className="card">
       <div className="mb-3 flex items-center justify-between">
-        <p className="text-sm font-semibold text-zinc-100">EAR over the last 10 seconds</p>
+        <p className="text-sm font-semibold text-white">EAR, last 10 seconds</p>
         <div className="flex items-center gap-4 text-xs text-zinc-400">
           <span className="flex items-center gap-1.5">
-            <span className="h-0.5 w-4 rounded bg-sky-400" />
-            EAR
+            <span className="h-0.5 w-4 rounded bg-emerald-400" />
+            open
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="h-0.5 w-4 rounded bg-rose-500" />
+            closed
           </span>
           <span className="flex items-center gap-1.5">
             <span className="w-4 border-t-2 border-dashed border-amber-400" />
-            Threshold
+            threshold
           </span>
         </div>
       </div>
-      <div className="relative h-44">
+      <div className="relative h-40">
         <canvas ref={canvasRef} className="h-full w-full" />
         {!active && (
           <p className="absolute inset-0 flex items-center justify-center text-sm text-zinc-500">

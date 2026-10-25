@@ -1,177 +1,92 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Alarm } from "@/lib/alarm";
-import { MovingAverage, type HeadPose } from "@/lib/metrics";
+import { AlertManager } from "@/lib/alerts";
+import { DrowsinessEngine, EMPTY_SNAPSHOT, type FrameDrawInfo, type Snapshot } from "@/lib/detector";
+import type { Landmark } from "@/lib/geometry";
+import type { HeadPoseEstimator } from "@/lib/headPose";
+import type { Tuning } from "@/lib/settings";
 
-export type DetectorStatus = "awake" | "drowsy" | "yawning" | "away" | "noface";
-
-export interface DetectorSettings {
-  earThreshold: number;
-  marThreshold: number;
-  consecFrames: number;
-  headThreshold: number;
-}
-
-export const DEFAULT_SETTINGS: DetectorSettings = {
-  earThreshold: 0.25,
-  marThreshold: 0.6,
-  consecFrames: 20,
-  headThreshold: 25,
-};
-
-export const YAWN_FRAMES = 15;
 export const HISTORY_MS = 10_000;
-const SMOOTHING_WINDOW = 5;
 const PUBLISH_EVERY_MS = 100;
-
-export interface FrameMetrics {
-  ear: number;
-  mar: number;
-  pose: HeadPose | null;
-}
-
-export interface FrameVerdict {
-  eyesClosed: boolean;
-  mouthOpen: boolean;
-}
 
 export interface EarSample {
   t: number;
   ear: number;
+  threshold: number;
 }
 
-export interface DetectorStats {
-  status: DetectorStatus;
-  ear: number | null;
-  mar: number | null;
-  pose: HeadPose | null;
-  closedFrames: number;
-  fps: number;
-}
-
-const IDLE_STATS: DetectorStats = {
-  status: "noface",
-  ear: null,
-  mar: null,
-  pose: null,
-  closedFrames: 0,
-  fps: 0,
-};
-
-function createState() {
-  return {
-    ear: new MovingAverage(SMOOTHING_WINDOW),
-    mar: new MovingAverage(SMOOTHING_WINDOW),
-    yaw: new MovingAverage(SMOOTHING_WINDOW),
-    pitch: new MovingAverage(SMOOTHING_WINDOW),
-    roll: new MovingAverage(SMOOTHING_WINDOW),
-    closedFrames: 0,
-    yawnFrames: 0,
-    status: "noface" as DetectorStatus,
-    lastPublish: 0,
-    fpsWindowStart: 0,
-    fpsFrames: 0,
-    fps: 0,
-  };
-}
-
-export function useDrowsinessDetector(settings: DetectorSettings) {
-  const [stats, setStats] = useState<DetectorStats>(IDLE_STATS);
+export function useDrowsinessDetector(tuning: Tuning) {
+  const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY_SNAPSHOT);
   const [muted, setMutedState] = useState(false);
-  const settingsRef = useRef(settings);
-  const stateRef = useRef<ReturnType<typeof createState> | null>(null);
-  const alarmRef = useRef<Alarm | null>(null);
+  const [sessionStart, setSessionStart] = useState<number | null>(null);
+
+  const tuningRef = useRef(tuning);
+  const alertsRef = useRef<AlertManager | null>(null);
+  const engineRef = useRef<DrowsinessEngine | null>(null);
   const historyRef = useRef<EarSample[]>([]);
+  const lastPublishRef = useRef(0);
+  const lastKeyRef = useRef("");
 
   useEffect(() => {
-    settingsRef.current = settings;
-  }, [settings]);
+    tuningRef.current = tuning;
+  }, [tuning]);
 
-  useEffect(() => () => alarmRef.current?.dispose(), []);
+  useEffect(() => () => alertsRef.current?.dispose(), []);
 
-  const getState = () => (stateRef.current ??= createState());
+  // Called from the Start button click so audio is allowed to play.
+  const newSession = useCallback(() => {
+    const manager = (alertsRef.current ??= new AlertManager());
+    manager.unlock();
+    manager.reset();
+    engineRef.current = new DrowsinessEngine(manager);
+    historyRef.current = [];
+    lastKeyRef.current = "";
+    setSnapshot(EMPTY_SNAPSHOT);
+    setSessionStart(Date.now());
+  }, []);
 
-  const armAudio = useCallback(() => {
-    alarmRef.current ??= new Alarm();
-    alarmRef.current.muted = muted;
-    alarmRef.current.unlock();
-  }, [muted]);
+  const endSession = useCallback(() => {
+    alertsRef.current?.reset();
+    engineRef.current = null;
+    historyRef.current = [];
+    setSnapshot(EMPTY_SNAPSHOT);
+    setSessionStart(null);
+  }, []);
+
+  const resetState = useCallback(() => {
+    engineRef.current?.resetState();
+    historyRef.current = [];
+  }, []);
+
+  const pauseAlerts = useCallback(() => alertsRef.current?.reset(), []);
 
   const setMuted = useCallback((value: boolean) => {
-    if (alarmRef.current) alarmRef.current.muted = value;
+    (alertsRef.current ??= new AlertManager()).setMuted(value);
     setMutedState(value);
   }, []);
 
-  const pause = useCallback(() => alarmRef.current?.stop(), []);
+  const processFrame = useCallback(
+    (landmarks: readonly Landmark[] | null, w: number, h: number): { draw: FrameDrawInfo; headPose: HeadPoseEstimator } | null => {
+      const engine = engineRef.current;
+      if (!engine) return null;
+      const now = performance.now();
+      const { snapshot: snap, draw } = engine.process(landmarks, w, h, tuningRef.current);
 
-  const reset = useCallback(() => {
-    alarmRef.current?.stop();
-    stateRef.current = createState();
-    historyRef.current = [];
-    setStats(IDLE_STATS);
-  }, []);
+      const history = historyRef.current;
+      while (history.length && history[0].t < now - HISTORY_MS) history.shift();
+      history.push({ t: now, ear: snap.faceDetected ? snap.avgEar : Number.NaN, threshold: snap.earThreshold });
 
-  const update = useCallback((metrics: FrameMetrics | null, now: number): FrameVerdict => {
-    const s = getState();
-    const cfg = settingsRef.current;
-
-    s.fpsFrames += 1;
-    if (now - s.fpsWindowStart >= 1000) {
-      if (s.fpsWindowStart > 0) s.fps = (s.fpsFrames * 1000) / (now - s.fpsWindowStart);
-      s.fpsWindowStart = now;
-      s.fpsFrames = 0;
-    }
-
-    const publish = (next: DetectorStats) => {
-      if (next.status !== s.status || now - s.lastPublish >= PUBLISH_EVERY_MS) {
-        s.lastPublish = now;
-        setStats(next);
+      const key = `${snap.faceDetected}|${snap.alertActive}|${snap.reasons.join()}|${snap.surpriseActive}|${snap.glasses}`;
+      if (key !== lastKeyRef.current || now - lastPublishRef.current >= PUBLISH_EVERY_MS) {
+        lastKeyRef.current = key;
+        lastPublishRef.current = now;
+        setSnapshot(snap);
       }
-      s.status = next.status;
-    };
+      return { draw, headPose: engine.headPose };
+    },
+    [],
+  );
 
-    const history = historyRef.current;
-    while (history.length && history[0].t < now - HISTORY_MS) history.shift();
-
-    if (!metrics) {
-      // Counters are kept as they are and resume once the face is back.
-      alarmRef.current?.stop();
-      for (const avg of [s.ear, s.mar, s.yaw, s.pitch, s.roll]) avg.clear();
-      history.push({ t: now, ear: Number.NaN });
-      publish({ ...IDLE_STATS, closedFrames: s.closedFrames, fps: s.fps });
-      return { eyesClosed: false, mouthOpen: false };
-    }
-
-    const ear = s.ear.push(metrics.ear);
-    const mar = s.mar.push(metrics.mar);
-    const pose = metrics.pose
-      ? {
-          yaw: s.yaw.push(metrics.pose.yaw),
-          pitch: s.pitch.push(metrics.pose.pitch),
-          roll: s.roll.push(metrics.pose.roll),
-        }
-      : null;
-
-    const eyesClosed = ear < cfg.earThreshold;
-    const mouthOpen = mar > cfg.marThreshold;
-    s.closedFrames = eyesClosed ? s.closedFrames + 1 : 0;
-    s.yawnFrames = mouthOpen ? s.yawnFrames + 1 : 0;
-    const lookingAway =
-      pose !== null && (Math.abs(pose.yaw) > cfg.headThreshold || Math.abs(pose.pitch) > cfg.headThreshold);
-
-    let status: DetectorStatus = "awake";
-    if (s.closedFrames >= cfg.consecFrames) status = "drowsy";
-    else if (s.yawnFrames >= YAWN_FRAMES) status = "yawning";
-    else if (lookingAway) status = "away";
-
-    if (status === "drowsy") alarmRef.current?.start();
-    else alarmRef.current?.stop();
-
-    history.push({ t: now, ear });
-    publish({ status, ear, mar, pose, closedFrames: s.closedFrames, fps: s.fps });
-    return { eyesClosed, mouthOpen };
-  }, []);
-
-  return { stats, muted, setMuted, armAudio, pause, reset, update, historyRef };
+  return { snapshot, muted, setMuted, sessionStart, newSession, endSession, resetState, pauseAlerts, processFrame, historyRef };
 }

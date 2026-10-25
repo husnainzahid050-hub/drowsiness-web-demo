@@ -1,69 +1,69 @@
 # Driver Drowsiness Detection — Live Web Demo
 
-A browser version of my Final Year Project (BS Artificial Intelligence). It detects eye closure, yawning and head pose in real time from your webcam, and the whole thing runs on your own device.
+A browser version of my Final Year Project (BS Artificial Intelligence). It watches your webcam in real time for eye closure, yawning and head nodding, and raises the same alarm as the desktop system. Everything runs on your own device.
 
 - **Live demo:** https://drowsiness-web-demo.vercel.app
-- **Original Python + OpenCV project:** ORIGINAL_REPO_URL
+- **Original Python + OpenCV project:** https://github.com/husnainzahid050-hub/cv-driver-drowness-detection
 
-This repo is a visual showcase that portfolio visitors can try in one click. The full system is still the original Python project.
+The detection logic is a direct TypeScript port of the Python project, with the same landmarks, formulas, thresholds and frame counters. Only the landmark model runs through MediaPipe Tasks for the web instead of MediaPipe for Python.
 
 ## Features
 
-- Live webcam feed (mirrored) with eye and mouth landmarks drawn on top, green when normal and red when closed or yawning
-- Optional full 478-point face mesh overlay
-- Driver status: **Awake**, **Drowsy**, **Yawning**, **Looking Away**, **No Face Detected**
-- Drowsiness alarm: pulsing red screen border and a beep made with the Web Audio API. It stops as soon as the eyes reopen, and there is a mute toggle.
-- Live EAR and MAR values with bars, yaw / pitch / roll in degrees, closed-eye frame counter and FPS
-- Graph of EAR over the last 10 seconds with a dashed threshold line
-- Sliders for the EAR threshold, MAR threshold, consecutive frames and head angle limit
-- Handles a blocked camera, a missing webcam, model loading, no face in frame and hidden tabs, and releases the camera when you stop
+- Live mirrored webcam with eye and mouth outlines (green normal, red closed/yawning, orange surprise) and 3D head-pose axes
+- **Eye closure:** EAR per eye and averaged, 5-frame smoothing, alarm after 20 consecutive frames below 0.21
+- **Yawn vs surprise:** 6-point MAR with hysteresis (0.50 in / 0.40 out), 30-frame confirmation, then a vote on opening speed, head movement and eyes against the driver's own baseline
+- **Head pose:** solvePnP on 6 landmarks against a 3D face model; nodding (pitch > 25°) or tilting (|roll| > 30°) for 25 frames
+- **Glasses mode:** detects steady, suppressed EAR and relaxes the threshold (−0.04) and frame count (×1.5)
+- **Alerts:** 880 Hz beep repeated every 60 frames + simulated seat vibration (300/100/300/100/800 ms buzz pattern); phones vibrate for real
+- Live EAR graph, per-feature frame counters, session stats, FPS and inference time
+- Sensitivity sliders (defaults = Python settings), sound and face-mesh toggles, Reset, **Stop Camera**
+- Video shows the moment the camera opens; the model loads in parallel with a progress bar
+- GPU (WebGL) with automatic CPU fallback, one-time GPU warm-up message, detection paused in hidden tabs
 
 ## Tech stack
 
-- [Next.js](https://nextjs.org) (App Router) + TypeScript
-- Tailwind CSS
-- [MediaPipe Face Landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) (`@mediapipe/tasks-vision`), running client-side with WebGL (GPU) and a CPU fallback
-- Canvas 2D for the overlay and the live graph
-- Web Audio API for the alarm, so there are no audio files
+- [Next.js](https://nextjs.org) (App Router) + TypeScript, Tailwind CSS
+- [MediaPipe Face Landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker) (`@mediapipe/tasks-vision`), client-side
+- Canvas 2D for the overlay and graph, Web Audio API for the alarm (no audio files)
 
-There is no backend, no API routes, no database and no environment variables.
+The MediaPipe runtime and model are served from this site (`public/`), not a third-party CDN. There is no backend, API route, database, analytics or environment variable.
 
 ## How it works
 
 ```
-Webcam → Face Landmarks → EAR / MAR / Pose → Threshold Logic → Alert
+Webcam frame → 468 face landmarks → EAR · MAR · head pose → frame counters → beep + seat vibration
 ```
 
-### Eye Aspect Ratio (EAR)
+| Python module             | Web port                |
+| ------------------------- | ----------------------- |
+| `config/settings.py`      | `lib/settings.ts`       |
+| `src/ear_calculator.py`   | `lib/ear.ts`            |
+| `src/yawn_detector.py`    | `lib/yawn.ts`           |
+| `src/head_pose.py`        | `lib/headPose.ts`       |
+| `src/glasses_detector.py` | `lib/glasses.ts`        |
+| `src/alert_manager.py`    | `lib/alerts.ts`         |
+| `src/detector.py`         | `lib/detector.ts`       |
 
-Six landmarks around each eye (p1 to p6):
+### Eye Aspect Ratio
 
 ```
 EAR = (|p2 − p6| + |p3 − p5|) / (2 × |p1 − p4|)
+left eye 362, 385, 387, 263, 373, 380 · right eye 33, 160, 158, 133, 153, 144
 ```
 
-| Eye   | p1  | p2  | p3  | p4  | p5  | p6  |
-| ----- | --- | --- | --- | --- | --- | --- |
-| Left  | 33  | 160 | 158 | 133 | 153 | 144 |
-| Right | 362 | 385 | 387 | 263 | 373 | 380 |
-
-The two eyes are averaged. An open eye scores around 0.3. When the lids close the vertical distances collapse while the width stays the same, so EAR falls. The driver is **drowsy** when the smoothed EAR stays below **0.25** for **20 consecutive frames**.
-
-### Mouth Aspect Ratio (MAR)
+### Mouth Aspect Ratio
 
 ```
-MAR = mean(|13−14|, |81−178|, |311−402|) / |78−308|
+MAR = (|p2 − p6| + |p3 − p5|) / (2 × |p1 − p4|)   on points 61, 82, 13, 291, 14, 87
 ```
-
-A yawn opens the mouth wide and holds it. MAR above **0.6** for **15 consecutive frames** counts as **yawning**.
 
 ### Head pose
 
-The Face Landmarker returns a 4×4 facial transformation matrix. Its rotation part is decomposed into yaw, pitch and roll in degrees. If |yaw| or |pitch| goes above **25°**, the driver is **looking away**.
+Nose (4), chin (152), eye corners (33, 263) and mouth corners (61, 291) are matched to a 3D face model. The rotation is found by minimising the reprojection error (Levenberg–Marquardt, as `cv2.solvePnP` does), then decomposed into pitch, yaw and roll. Positive pitch means the head is dropping forward.
 
-### Smoothing and frames
+### Alarm
 
-EAR, MAR and the angles are smoothed with a 5-frame moving average. Detection only runs when the camera delivers a new frame, so the frame counters follow the camera rate (usually 30 FPS) rather than the screen refresh rate. When no face is visible, the counters pause and the alarm stops.
+The alarm starts when any of these holds: eyes closed for the frame limit, a bad head pose for 25 frames, or a confirmed yawn. It stops as soon as none of them holds.
 
 ## Run locally
 
@@ -71,24 +71,20 @@ Requires Node.js 20 or newer.
 
 ```bash
 npm install
-npm run dev
+npm run dev        # copies the MediaPipe runtime into public/ and starts http://localhost:3000
+npm run build      # production build
 ```
 
-Open http://localhost:3000 and click **Start Camera**. Browsers only allow webcam access on `localhost` or over HTTPS.
-
-```bash
-npm run build   # production build
-npm start       # serve the production build
-```
+Browsers only allow webcam access on `localhost` or over HTTPS.
 
 ## Deploy
 
-Import the repository on [Vercel](https://vercel.com/new) and keep the defaults. No configuration is needed.
+Import the repository on [Vercel](https://vercel.com/new) and keep the defaults.
 
 ## Privacy
 
-Everything runs in your browser. No video or images are uploaded or stored. The page downloads only the MediaPipe runtime (from jsDelivr) and the face landmark model (from Google's model storage). Your camera frames never leave your device.
+Everything runs in your browser. No video, images or measurements are uploaded, recorded or stored, not even in browser storage. Closing the tab or pressing **Stop Camera** turns the camera off.
 
 ## Author
 
-**Husnain Abbasi**: GITHUB_REPO_URL · LINKEDIN_URL
+**Husnain Abbasi** · https://github.com/husnainzahid050-hub · LINKEDIN_URL

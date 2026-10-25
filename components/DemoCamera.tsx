@@ -1,51 +1,37 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { FaceLandmarkerResult } from "@mediapipe/tasks-vision";
-import { createFaceLandmarker, type FaceModel } from "@/lib/faceLandmarker";
-import { computeEar, computeMar, headPoseFromMatrix, toPixels } from "@/lib/metrics";
+import { loadFaceModel, type Delegate, type FaceModel } from "@/lib/faceLandmarker";
 import { clearOverlay, drawOverlay } from "@/lib/draw";
+import { DEFAULT_TUNING, Settings, type Tuning } from "@/lib/settings";
 import { START_DEMO_EVENT } from "@/lib/site";
-import { DEFAULT_SETTINGS, useDrowsinessDetector, type DetectorSettings } from "@/hooks/useDrowsinessDetector";
-import StatsPanel from "./StatsPanel";
+import { useDrowsinessDetector } from "@/hooks/useDrowsinessDetector";
+import VideoHud from "./VideoHud";
+import StatusPanel from "./StatusPanel";
 import EarChart from "./EarChart";
-import Controls from "./Controls";
+import Sensitivity from "./Sensitivity";
+import { CameraIcon, LockIcon, Spinner } from "./icons";
 
-type Phase = "idle" | "loading" | "running" | "error";
-type CameraError = "denied" | "nodevice" | "busy" | "unsupported" | "model" | "unknown";
+type Phase = "idle" | "starting" | "live" | "error";
+export type ModelState = "idle" | "loading" | "ready" | "error";
+type CameraError = "denied" | "nodevice" | "busy" | "unsupported" | "unknown";
 
 const ERRORS: Record<CameraError, { title: string; body: string }> = {
   denied: {
     title: "Camera access was blocked",
-    body: "Allow camera access for this site in your browser (usually the camera icon in the address bar), then try again.",
+    body: "Allow camera access for this site (camera icon in the address bar), then press Try again.",
   },
-  nodevice: {
-    title: "No webcam found",
-    body: "This demo needs a webcam to see your face. Connect a camera and try again.",
-  },
+  nodevice: { title: "No webcam found", body: "This demo needs a webcam. Connect a camera and try again." },
   busy: {
-    title: "Camera is in use",
-    body: "Another app or tab is using your camera. Close it and try again.",
+    title: "Camera is busy",
+    body: "Another app or browser tab is using the camera. Close it and try again.",
   },
   unsupported: {
     title: "Camera not available",
-    body: "Your browser does not allow camera access here. Open the page over HTTPS in a recent Chrome, Edge or Firefox.",
+    body: "This browser does not allow camera access here. Use a recent Chrome, Edge or Firefox over HTTPS.",
   },
-  model: {
-    title: "Could not load the AI model",
-    body: "The face landmark model failed to download. Check your connection and try again.",
-  },
-  unknown: {
-    title: "Something went wrong",
-    body: "The camera could not be started. Please try again.",
-  },
+  unknown: { title: "Could not start the camera", body: "Something went wrong while opening the camera. Please try again." },
 };
-
-class CameraFailure extends Error {
-  constructor(readonly kind: CameraError) {
-    super(kind);
-  }
-}
 
 function cameraErrorKind(err: unknown): CameraError {
   const name = err instanceof DOMException ? err.name : "";
@@ -55,86 +41,143 @@ function cameraErrorKind(err: unknown): CameraError {
   return "unknown";
 }
 
+type FrameHandle = { kind: "vfc" | "raf"; id: number } | null;
+
 export default function DemoCamera() {
   const sectionRef = useRef<HTMLElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const modelRef = useRef<FaceModel | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const lastVideoTimeRef = useRef(-1);
+  const handleRef = useRef<FrameHandle>(null);
   const runningRef = useRef(false);
   const startingRef = useRef(false);
   const mountedRef = useRef(true);
-  const showMeshRef = useRef(false);
+  const meshRef = useRef(false);
+  const failuresRef = useRef(0);
+  const fallbackRef = useRef(false);
+  const inferMsRef = useRef(0);
+  const inferPublishRef = useRef(0);
+  const detectAllowedRef = useRef(false);
 
   const [phase, setPhase] = useState<Phase>("idle");
-  const [error, setError] = useState<CameraError | null>(null);
-  const [settings, setSettings] = useState<DetectorSettings>(DEFAULT_SETTINGS);
+  const [cameraError, setCameraError] = useState<CameraError | null>(null);
+  const [modelState, setModelState] = useState<ModelState>("idle");
+  const [modelProgress, setModelProgress] = useState(0);
+  const [delegate, setDelegate] = useState<Delegate | null>(null);
+  const [inferMs, setInferMs] = useState(0);
+  const [resolution, setResolution] = useState("");
+  const [tuning, setTuning] = useState<Tuning>(DEFAULT_TUNING);
   const [showMesh, setShowMesh] = useState(false);
-  const { stats, muted, setMuted, armAudio, pause, reset, update, historyRef } = useDrowsinessDetector(settings);
+  const [gpuWarming, setGpuWarming] = useState(false);
+
+  const detector = useDrowsinessDetector(tuning);
+  const { snapshot, muted, setMuted, sessionStart, newSession, endSession, resetState, pauseAlerts, processFrame, historyRef } =
+    detector;
 
   useEffect(() => {
-    showMeshRef.current = showMesh;
+    meshRef.current = showMesh;
   }, [showMesh]);
 
+  const ensureModel = useCallback((preferred: Delegate = "GPU") => {
+    if (modelRef.current) return;
+    setModelState("loading");
+    loadFaceModel(preferred, (p) => mountedRef.current && setModelProgress(p))
+      .then((model) => {
+        if (!mountedRef.current) return;
+        modelRef.current = model;
+        setDelegate(model.delegate);
+        setGpuWarming(!model.warmed);
+        setModelState("ready");
+      })
+      .catch(() => mountedRef.current && setModelState("error"));
+  }, []);
+
+  const switchToCpu = useCallback(() => {
+    if (fallbackRef.current) return;
+    fallbackRef.current = true;
+    loadFaceModel("CPU")
+      .then((model) => {
+        if (!mountedRef.current) return;
+        modelRef.current = model;
+        failuresRef.current = 0;
+        setDelegate("CPU");
+        setGpuWarming(false);
+      })
+      .catch(() => mountedRef.current && setModelState("error"));
+  }, []);
+
   const stopLoop = useCallback(() => {
-    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
-    rafRef.current = null;
+    const handle = handleRef.current;
+    const video = videoRef.current;
+    if (handle?.kind === "vfc") video?.cancelVideoFrameCallback(handle.id);
+    if (handle?.kind === "raf") cancelAnimationFrame(handle.id);
+    handleRef.current = null;
   }, []);
 
   const startLoop = useCallback(() => {
     stopLoop();
-    lastVideoTimeRef.current = -1;
+    const video = videoRef.current;
+    if (!video) return;
+    let lastTime = -1;
 
-    const tick = () => {
-      rafRef.current = requestAnimationFrame(tick);
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      const model = modelRef.current;
-      if (!video || !canvas || !model || video.readyState < 2) return;
-      // Only run detection when the camera delivered a new frame, so frame
-      // counters follow the camera rate rather than the display refresh rate.
-      if (video.currentTime === lastVideoTimeRef.current) return;
-      lastVideoTimeRef.current = video.currentTime;
-
-      const now = performance.now();
-      let result: FaceLandmarkerResult;
-      try {
-        result = model.landmarker.detectForVideo(video, now);
-      } catch {
-        return;
-      }
-
-      const landmarks = result.faceLandmarks[0];
-      if (!landmarks) {
-        update(null, now);
-        clearOverlay(canvas);
-        return;
-      }
-
-      const width = video.videoWidth;
-      const height = video.videoHeight;
-      if (canvas.width !== width || canvas.height !== height) {
-        canvas.width = width;
-        canvas.height = height;
-      }
-
-      const pts = toPixels(landmarks, width, height);
-      const matrix = result.facialTransformationMatrixes?.[0];
-      const verdict = update(
-        {
-          ear: computeEar(pts),
-          mar: computeMar(pts),
-          pose: matrix ? headPoseFromMatrix(matrix.data) : null,
-        },
-        now,
-      );
-      drawOverlay(canvas, pts, model.connections, { ...verdict, showMesh: showMeshRef.current });
+    // requestVideoFrameCallback fires once per camera frame, so detection runs
+    // exactly at the camera rate (like the Python cap.read() loop).
+    const schedule = () => {
+      handleRef.current =
+        typeof video.requestVideoFrameCallback === "function"
+          ? { kind: "vfc", id: video.requestVideoFrameCallback(onFrame) }
+          : { kind: "raf", id: requestAnimationFrame(onFrame) };
     };
 
-    rafRef.current = requestAnimationFrame(tick);
-  }, [stopLoop, update]);
+    const onFrame = () => {
+      if (!runningRef.current) return;
+      schedule();
+      const canvas = canvasRef.current;
+      const model = modelRef.current;
+      if (!canvas || !model || video.readyState < 2 || video.videoWidth === 0) return;
+      // Let the "preparing" message paint before the first GPU run blocks.
+      if (!model.warmed && !detectAllowedRef.current) return;
+      if (video.currentTime === lastTime) return;
+      lastTime = video.currentTime;
+
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+
+      const started = performance.now();
+      let landmarks;
+      try {
+        landmarks = model.landmarker.detectForVideo(video, started).faceLandmarks[0] ?? null;
+        failuresRef.current = 0;
+      } catch {
+        failuresRef.current += 1;
+        if (failuresRef.current >= 5 && model.delegate === "GPU") switchToCpu();
+        return;
+      }
+      if (!model.warmed && landmarks) {
+        // This frame compiled the GPU shaders; its time says nothing about speed.
+        model.warmed = true;
+        setGpuWarming(false);
+      } else {
+        const took = performance.now() - started;
+        inferMsRef.current = inferMsRef.current ? inferMsRef.current * 0.8 + took * 0.2 : took;
+        if (started - inferPublishRef.current > 500) {
+          inferPublishRef.current = started;
+          setInferMs(inferMsRef.current);
+        }
+      }
+
+      const out = processFrame(landmarks, w, h);
+      if (landmarks && out) drawOverlay(canvas, landmarks, out.draw, out.headPose, meshRef.current ? model.tesselation : null);
+      else clearOverlay(canvas);
+    };
+
+    schedule();
+  }, [stopLoop, processFrame, switchToCpu]);
 
   const releaseCamera = useCallback(() => {
     runningRef.current = false;
@@ -147,8 +190,8 @@ export default function DemoCamera() {
       video.srcObject = null;
     }
     if (canvasRef.current) clearOverlay(canvasRef.current);
-    reset();
-  }, [stopLoop, reset]);
+    endSession();
+  }, [stopLoop, endSession]);
 
   const stopCamera = useCallback(() => {
     releaseCamera();
@@ -158,51 +201,77 @@ export default function DemoCamera() {
   const startCamera = useCallback(async () => {
     if (startingRef.current || runningRef.current) return;
     startingRef.current = true;
-    armAudio();
-    setError(null);
-    setPhase("loading");
+    newSession();
+    setCameraError(null);
+    setPhase("starting");
+    ensureModel();
 
     try {
-      if (!navigator.mediaDevices?.getUserMedia) throw new CameraFailure("unsupported");
-
-      const modelPromise = createFaceLandmarker();
-      modelPromise.catch(() => undefined);
-
-      let stream: MediaStream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
-          audio: false,
-        });
-      } catch (err) {
-        throw new CameraFailure(cameraErrorKind(err));
+      if (!navigator.mediaDevices?.getUserMedia) throw new DOMException("", "NotSupportedError");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: "user",
+          width: { ideal: Settings.FRAME_WIDTH },
+          height: { ideal: Settings.FRAME_HEIGHT },
+          frameRate: { ideal: Settings.TARGET_FPS, max: Settings.TARGET_FPS },
+        },
+      });
+      if (!mountedRef.current) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
       }
       streamRef.current = stream;
-      if (!mountedRef.current) return releaseCamera();
-
-      try {
-        modelRef.current = await modelPromise;
-      } catch {
-        throw new CameraFailure("model");
-      }
-      if (!mountedRef.current || !streamRef.current) return releaseCamera();
 
       const video = videoRef.current;
-      if (!video) throw new CameraFailure("unknown");
+      if (!video) throw new Error("no video element");
+      video.muted = true;
+      video.playsInline = true;
       video.srcObject = stream;
       await video.play();
+      setResolution(`${video.videoWidth}×${video.videoHeight}`);
 
       runningRef.current = true;
-      setPhase("running");
+      setPhase("live");
       if (!document.hidden) startLoop();
     } catch (err) {
       releaseCamera();
-      setError(err instanceof CameraFailure ? err.kind : "unknown");
+      const unsupported = err instanceof DOMException && err.name === "NotSupportedError";
+      setCameraError(unsupported ? "unsupported" : cameraErrorKind(err));
       setPhase("error");
     } finally {
       startingRef.current = false;
     }
-  }, [armAudio, releaseCamera, startLoop]);
+  }, [newSession, ensureModel, startLoop, releaseCamera]);
+
+  useEffect(() => {
+    detectAllowedRef.current = false;
+    if (phase !== "live" || !gpuWarming) return;
+    let id = requestAnimationFrame(() => {
+      id = requestAnimationFrame(() => {
+        detectAllowedRef.current = true;
+      });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [phase, gpuWarming]);
+
+  // Warm the model up as soon as the demo is on screen, so it is usually
+  // ready before the visitor clicks Start Camera.
+  useEffect(() => {
+    const el = sectionRef.current;
+    if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          ensureModel();
+          io.disconnect();
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [ensureModel]);
 
   useEffect(() => {
     const onStart = () => {
@@ -218,14 +287,14 @@ export default function DemoCamera() {
       if (!runningRef.current) return;
       if (document.hidden) {
         stopLoop();
-        pause();
+        pauseAlerts();
       } else {
         startLoop();
       }
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => document.removeEventListener("visibilitychange", onVisibility);
-  }, [startLoop, stopLoop, pause]);
+  }, [startLoop, stopLoop, pauseAlerts]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -235,83 +304,101 @@ export default function DemoCamera() {
     };
   }, [releaseCamera]);
 
-  const drowsy = phase === "running" && stats.status === "drowsy";
+  const live = phase === "live";
+  const alarm = live && snapshot.alertActive;
 
   return (
     <section ref={sectionRef} id="demo" className="scroll-mt-6">
-      {drowsy && (
-        <div
-          aria-hidden
-          className="alarm-flash pointer-events-none fixed inset-0 z-50 border-[10px] border-red-500 bg-red-500/10"
-        />
+      {alarm && (
+        <div aria-hidden className="alarm-flash pointer-events-none">
+          <span className="fixed inset-x-0 top-0 z-50 h-3 bg-rose-500" />
+          <span className="fixed inset-x-0 bottom-0 z-50 h-3 bg-rose-500" />
+          <span className="fixed inset-y-0 left-0 z-50 w-3 bg-rose-500" />
+          <span className="fixed inset-y-0 right-0 z-50 w-3 bg-rose-500" />
+        </div>
       )}
 
-      <div className="mb-6 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+      <div className="mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
         <div>
-          <h2 className="text-2xl font-semibold tracking-tight text-zinc-50">Live demo</h2>
-          <p className="mt-1 text-sm text-zinc-400">
-            Look at the camera, then close your eyes for a second or two, yawn, or turn your head.
+          <p className="eyebrow">Live demo</p>
+          <h2 className="mt-1 text-3xl font-semibold tracking-tight text-white">Try it with your webcam</h2>
+          <p className="mt-2 max-w-xl text-sm text-zinc-400">
+            Close your eyes for about a second, yawn slowly, or nod your head forward. The alarm and the seat vibration
+            start exactly as in the desktop version.
           </p>
         </div>
-        <p className="flex items-center gap-2 text-xs text-zinc-400">
-          <LockIcon />
-          Everything runs in your browser. No video or images are uploaded or stored.
+        <p className="flex items-center gap-2 self-start rounded-full border border-emerald-500/20 bg-emerald-500/5 px-3 py-1.5 text-xs text-emerald-200 md:self-auto">
+          <LockIcon className="h-3.5 w-3.5" />
+          100% in your browser. Nothing is uploaded, recorded or saved.
         </p>
       </div>
 
-      <p className="mb-4 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-400 md:hidden">
-        Best experienced on desktop Chrome.
+      <p className="mb-4 rounded-xl border border-white/5 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-400 md:hidden">
+        Best experienced on desktop Chrome or Edge.
       </p>
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)]">
-        <div className="flex flex-col gap-6">
+        <div className="flex flex-col gap-4 lg:sticky lg:top-6 lg:self-start">
           <div
-            className={`relative aspect-[4/3] overflow-hidden rounded-2xl border bg-zinc-900 transition-colors ${
-              drowsy ? "border-red-500 shadow-[0_0_40px_-8px_rgba(239,68,68,0.7)]" : "border-zinc-800"
+            className={`relative aspect-[4/3] overflow-hidden rounded-3xl bg-zinc-950 ring-1 transition-shadow ${
+              alarm ? "ring-2 ring-rose-500 shadow-[0_0_60px_-10px_rgba(244,63,94,0.8)]" : "ring-white/10"
             }`}
           >
             <video
               ref={videoRef}
               playsInline
               muted
-              className={`absolute inset-0 h-full w-full -scale-x-100 object-cover ${phase === "running" ? "" : "invisible"}`}
+              className={`absolute inset-0 h-full w-full -scale-x-100 object-cover ${live ? "" : "invisible"}`}
             />
             <canvas
               ref={canvasRef}
-              className={`absolute inset-0 h-full w-full -scale-x-100 object-cover ${phase === "running" ? "" : "invisible"}`}
+              className={`pointer-events-none absolute inset-0 h-full w-full -scale-x-100 object-cover ${live ? "" : "invisible"}`}
             />
 
-            {phase === "running" && (
-              <span className="absolute left-3 top-3 flex items-center gap-1.5 rounded-full bg-black/60 px-2.5 py-1 text-xs font-medium text-zinc-200 backdrop-blur">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-red-500" />
-                Live
-              </span>
+            {live && (
+              <VideoHud
+                snapshot={snapshot}
+                modelState={modelState}
+                modelProgress={modelProgress}
+                warming={gpuWarming}
+                delegate={delegate}
+                inferMs={inferMs}
+                resolution={resolution}
+                onRetryModel={() => ensureModel()}
+              />
             )}
 
             {phase === "idle" && (
               <Overlay>
-                <CameraIcon />
-                <p className="max-w-xs text-sm text-zinc-400">
-                  Start the camera to run face landmark detection on your webcam, right here in the browser.
-                </p>
-                <button type="button" onClick={() => void startCamera()} className="btn-primary">
+                <div className="grid h-16 w-16 place-items-center rounded-2xl bg-white/5 ring-1 ring-white/10">
+                  <CameraIcon className="h-8 w-8 text-zinc-400" />
+                </div>
+                <div>
+                  <p className="text-lg font-medium text-white">Camera is off</p>
+                  <p className="mt-1 max-w-sm text-sm text-zinc-400">
+                    Your video stays on this device. Detection runs on every frame, in real time.
+                  </p>
+                </div>
+                <button type="button" onClick={() => void startCamera()} className="btn-primary px-6 py-3 text-base">
+                  <CameraIcon className="h-5 w-5" />
                   Start Camera
                 </button>
+                <ModelBadge state={modelState} progress={modelProgress} />
               </Overlay>
             )}
 
-            {phase === "loading" && (
+            {phase === "starting" && (
               <Overlay>
-                <span className="h-10 w-10 animate-spin rounded-full border-2 border-zinc-700 border-t-emerald-400" />
-                <p className="text-sm text-zinc-300">Loading AI model...</p>
+                <Spinner />
+                <p className="text-sm text-zinc-300">Opening camera…</p>
                 <p className="text-xs text-zinc-500">Allow camera access if your browser asks.</p>
               </Overlay>
             )}
 
-            {phase === "error" && error && (
+            {phase === "error" && cameraError && (
               <Overlay>
-                <p className="text-base font-medium text-zinc-100">{ERRORS[error].title}</p>
-                <p className="max-w-sm text-sm text-zinc-400">{ERRORS[error].body}</p>
+                <p className="text-lg font-medium text-white">{ERRORS[cameraError].title}</p>
+                <p className="max-w-sm text-sm text-zinc-400">{ERRORS[cameraError].body}</p>
                 <button type="button" onClick={() => void startCamera()} className="btn-primary">
                   Try again
                 </button>
@@ -319,21 +406,31 @@ export default function DemoCamera() {
             )}
           </div>
 
-          <EarChart historyRef={historyRef} threshold={settings.earThreshold} active={phase === "running"} />
+          <div className="flex flex-wrap items-center gap-2">
+            {live || phase === "starting" ? (
+              <button type="button" onClick={stopCamera} className="btn-danger">
+                <StopIcon />
+                Stop Camera
+              </button>
+            ) : (
+              <button type="button" onClick={() => void startCamera()} className="btn-primary">
+                <CameraIcon className="h-4 w-4" />
+                Start Camera
+              </button>
+            )}
+            <button type="button" onClick={resetState} disabled={!live} className="btn-ghost">
+              Reset
+            </button>
+            <ToggleChip label="Sound" on={!muted} onChange={(v) => setMuted(!v)} />
+            <ToggleChip label="Face mesh" on={showMesh} onChange={setShowMesh} />
+          </div>
+
+          <EarChart historyRef={historyRef} active={live && modelState === "ready" && !gpuWarming} />
         </div>
 
-        <div className="flex flex-col gap-6">
-          <StatsPanel stats={stats} settings={settings} active={phase === "running"} />
-          <Controls
-            settings={settings}
-            onChange={setSettings}
-            showMesh={showMesh}
-            onShowMesh={setShowMesh}
-            muted={muted}
-            onMute={setMuted}
-            running={phase === "running"}
-            onStop={stopCamera}
-          />
+        <div className="flex flex-col gap-4">
+          <StatusPanel snapshot={snapshot} live={live} modelReady={modelState === "ready" && !gpuWarming} sessionStart={sessionStart} muted={muted} />
+          <Sensitivity tuning={tuning} onChange={setTuning} />
         </div>
       </div>
     </section>
@@ -342,23 +439,49 @@ export default function DemoCamera() {
 
 function Overlay({ children }: { children: React.ReactNode }) {
   return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 p-6 text-center">{children}</div>
+    <div className="absolute inset-0 flex flex-col items-center justify-center gap-5 bg-[radial-gradient(circle_at_center,rgba(16,185,129,0.08),transparent_60%)] p-6 text-center">
+      {children}
+    </div>
   );
 }
 
-function CameraIcon() {
+function ModelBadge({ state, progress }: { state: ModelState; progress: number }) {
+  if (state === "idle") return null;
+  const text =
+    state === "ready"
+      ? "AI model ready"
+      : state === "error"
+        ? "AI model will load when you start"
+        : `Preparing AI model… ${Math.round(progress * 100)}%`;
   return (
-    <svg viewBox="0 0 24 24" className="h-12 w-12 text-zinc-600" fill="none" stroke="currentColor" strokeWidth={1.5}>
-      <path d="M15 10l4.55-2.28A1 1 0 0121 8.62v6.76a1 1 0 01-1.45.9L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-    </svg>
+    <p className="flex items-center gap-2 text-xs text-zinc-500">
+      <span className={`h-1.5 w-1.5 rounded-full ${state === "ready" ? "bg-emerald-400" : "bg-zinc-500"}`} />
+      {text}
+    </p>
   );
 }
 
-function LockIcon() {
+function ToggleChip({ label, on, onChange }: { label: string; on: boolean; onChange: (v: boolean) => void }) {
   return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4 shrink-0 text-emerald-400" fill="none" stroke="currentColor" strokeWidth={2}>
-      <rect x="5" y="11" width="14" height="10" rx="2" />
-      <path d="M8 11V7a4 4 0 018 0v4" />
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      onClick={() => onChange(!on)}
+      className={`inline-flex items-center gap-2 rounded-xl px-3.5 py-2.5 text-sm font-medium ring-1 transition-colors ${
+        on ? "bg-emerald-500/10 text-emerald-200 ring-emerald-500/30" : "bg-zinc-900 text-zinc-400 ring-white/10 hover:text-zinc-200"
+      }`}
+    >
+      <span className={`h-2 w-2 rounded-full ${on ? "bg-emerald-400" : "bg-zinc-600"}`} />
+      {label} {on ? "on" : "off"}
+    </button>
+  );
+}
+
+function StopIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
     </svg>
   );
 }

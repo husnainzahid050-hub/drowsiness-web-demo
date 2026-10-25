@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# mediapipe runtime (copied from node_modules on dev/build)
+/public/mediapipe
